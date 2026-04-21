@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (例: v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+jobs:
+  release:
+    name: Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write   # GitHub Release 作成に必要
+
+    steps:
+      # ---- 層 0: 現状把握 ----
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show context
+        run: |
+          echo "=== Repository contents ==="
+          ls -la
+          echo "=== Git info ==="
+          git log -1 --oneline
+
+      # ---- 層 1: ZIP 自動展開 ----
+      - name: Auto-extract ZIP files
+        run: |
+          shopt -s nullglob
+          for z in *.zip; do
+            echo "📦 Extracting $z"
+            unzip -o "$z"
+          done
+
+      # ---- 層 2: プロジェクト自動検出 ----
+      - name: Locate Gradle project
+        id: find
+        run: |
+          SETTINGS=$(find . -maxdepth 4 -type f \
+            \( -name "settings.gradle.kts" -o -name "settings.gradle" \) \
+            -not -path "./.git/*" 2>/dev/null | head -n1)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::settings.gradle(.kts) not found"
+            exit 1
+          fi
+          ROOT=$(dirname "$SETTINGS")
+          ROOT="${ROOT#./}"
+          [ -z "$ROOT" ] && ROOT="."
+          echo "✅ Gradle project root: '$ROOT'"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          if [ "$ROOT" = "." ]; then
+            echo "prefix=" >> "$GITHUB_OUTPUT"
+          else
+            echo "prefix=$ROOT/" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- JDK & Gradle ----
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+          build-root-directory: ${{ steps.find.outputs.root }}
+
+      # ---- 層 3: Wrapper 自動生成 ----
+      - name: Generate Gradle wrapper if missing
+        working-directory: ${{ steps.find.outputs.root }}
+        run: |
+          if [ ! -f gradlew ]; then
+            echo "⚙️ Generating Gradle wrapper (8.7)..."
+            gradle wrapper --gradle-version 8.7 --distribution-type bin
+          fi
+          chmod +x gradlew
+
+      # ---- 署名キーストアの復元（Secrets が設定されている場合のみ） ----
+      - name: Decode keystore if provided
+        id: keystore
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > $RUNNER_TEMP/release.keystore
+          echo "path=$RUNNER_TEMP/release.keystore" >> "$GITHUB_OUTPUT"
+
+      # ---- ビルド（署名あり） ----
+      - name: Build release APK (signed)
+        if: ${{ steps.keystore.outputs.path != '' }}
+        working-directory: ${{ steps.find.outputs.root }}
+        env:
+          KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # ---- ビルド（署名なし・Secrets 未設定時） ----
+      - name: Build release APK (unsigned)
+        if: ${{ steps.keystore.outputs.path == '' }}
+        working-directory: ${{ steps.find.outputs.root }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # ---- APK リネーム ----
+      - name: Rename APK
+        run: |
+          APK=$(find "${{ steps.find.outputs.prefix }}app/build/outputs/apk/release" -name "*.apk" | head -n1)
+          TAG="${{ github.ref_name || github.event.inputs.tag }}"
+          NEW_NAME="VideoLab-${TAG}.apk"
+          cp "$APK" "$NEW_NAME"
+          echo "apk=$NEW_NAME" >> "$GITHUB_OUTPUT"
+          echo "✅ Renamed to $NEW_NAME"
+        id: rename
+
+      # ---- GitHub Release に公開 ----
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.rename.outputs.apk }}
+          generate_release_notes: true
+
+      # ---- Artifacts にもアップロード（workflow_dispatch 用） ----
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: ${{ steps.find.outputs.prefix }}app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
